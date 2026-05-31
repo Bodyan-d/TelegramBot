@@ -225,6 +225,7 @@ def order_admin_keyboard(order_id: int, user_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Oznacz jako wydane", callback_data=f"admin:issue:{order_id}"),
                 InlineKeyboardButton(text="Anuluj", callback_data=f"admin:cancel_order:{order_id}"),
             ],
+            [InlineKeyboardButton(text="Zmień cenę", callback_data=f"admin:price:{order_id}")],
             [InlineKeyboardButton(text="Otwórz klienta", url=f"tg://user?id={user_id}")],
         ]
     )
@@ -512,6 +513,10 @@ class ProductPhoto(StatesGroup):
 
 class StockEdit(StatesGroup):
     quantity = State()
+
+
+class OrderPriceEdit(StatesGroup):
+    amount = State()
 
 
 @dataclass
@@ -1852,6 +1857,7 @@ async def admin_orders(callback: CallbackQuery, admin_id: int) -> None:
                     (f"Anuluj #{order['id']}", f"admin:cancel_order:{order['id']}"),
                 ]
             )
+            rows.append([(f"Zmień cenę #{order['id']}", f"admin:price:{order['id']}")])
     rows.append([("Wróć", "admin")])
     await edit_or_answer(callback, "\n".join(lines), kb(rows))
 
@@ -1928,6 +1934,70 @@ async def admin_cancel_order(callback: CallbackQuery, admin_id: int) -> None:
 
     await answer_callback(callback, "Zamówienie anulowane.", show_alert=True)
     await admin_orders(callback, admin_id)
+
+
+async def admin_price_start(callback: CallbackQuery, state: FSMContext, admin_id: int) -> None:
+    if not await admin_only(callback, admin_id):
+        return
+    order_id = int(callback.data.split(":")[2])
+    with closing(db()) as conn:
+        order = conn.execute(
+            "SELECT id, total, status FROM orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+    if not order:
+        await answer_callback(callback, "Zamówienie nie istnieje.", show_alert=True)
+        return
+    if order["status"] != "pending":
+        await answer_callback(callback, "Cenę można zmienić tylko dla aktywnego zamówienia.", show_alert=True)
+        return
+
+    await state.update_data(order_id=order_id)
+    await state.set_state(OrderPriceEdit.amount)
+    await callback.message.answer(
+        f"Podaj nową cenę brutto dla zamówienia #{order_id}.\n"
+        f"Obecnie: {money(order['total'])}\n\n"
+        "Przykład: 120 albo 120.50"
+    )
+    await answer_callback(callback)
+
+
+async def save_order_price(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    order_id = int(data["order_id"])
+    try:
+        new_total = Decimal(message.text.strip().replace(",", "."))
+        if new_total < 0:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        await message.answer("Podaj poprawną kwotę, np. 120 albo 120.50.")
+        return
+
+    with closing(db()) as conn:
+        order = conn.execute("SELECT notes, status FROM orders WHERE id = ?", (order_id,)).fetchone()
+        if not order:
+            await message.answer("Zamówienie nie istnieje.")
+            await state.clear()
+            return
+        if order["status"] != "pending":
+            await message.answer("Cenę można zmienić tylko dla aktywnego zamówienia.")
+            await state.clear()
+            return
+
+        price_note = f"Cena zmieniona ręcznie przez administratora na {money(new_total)}."
+        notes = order["notes"] or ""
+        notes = f"{notes}\n{price_note}".strip() if notes else price_note
+        conn.execute(
+            "UPDATE orders SET total = ?, notes = ? WHERE id = ?",
+            (float(new_total), notes, order_id),
+        )
+        conn.commit()
+
+    await state.clear()
+    await message.answer(
+        f"Cena zamówienia #{order_id} została zmieniona na {money(new_total)}.",
+        reply_markup=admin_menu(),
+    )
 
 
 def bar(value: int, max_value: int) -> str:
@@ -2078,6 +2148,9 @@ async def main() -> None:
     async def admin_cancel_order_handler(callback: CallbackQuery) -> None:
         await admin_cancel_order(callback, config.admin_id)
 
+    async def admin_price_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await admin_price_start(callback, state, config.admin_id)
+
     async def admin_stats_handler(callback: CallbackQuery) -> None:
         await admin_stats(callback, config.admin_id)
 
@@ -2113,6 +2186,7 @@ async def main() -> None:
     dp.callback_query.register(admin_delete_do_handler, F.data.startswith("admin:delete:do:"))
     dp.callback_query.register(admin_issue_handler, F.data.startswith("admin:issue:"))
     dp.callback_query.register(admin_cancel_order_handler, F.data.startswith("admin:cancel_order:"))
+    dp.callback_query.register(admin_price_start_handler, F.data.startswith("admin:price:"))
     dp.callback_query.register(admin_stats_handler, F.data == "admin:stats")
 
     dp.callback_query.register(add_product_type, AddProduct.product_type, F.data.startswith("add:type:"))
@@ -2136,6 +2210,7 @@ async def main() -> None:
     dp.message.register(save_quantity, QuantityEdit.amount)
     dp.message.register(save_product_photo, ProductPhoto.photo)
     dp.message.register(save_stock_quantity, StockEdit.quantity)
+    dp.message.register(save_order_price, OrderPriceEdit.amount)
     dp.message.register(custom_order_user, CustomOrder.user_id)
     dp.message.register(custom_order_items, CustomOrder.items)
     dp.message.register(custom_order_total_handler, CustomOrder.total)
