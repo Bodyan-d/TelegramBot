@@ -335,7 +335,8 @@ def product_text(product: sqlite3.Row) -> str:
     if product["category"] == "disposables":
         return "\n".join(
             [
-                f"<b>{product_display_name(product)}</b>",
+                f"<b>{product['brand'] or product['name']}</b>",
+                "",
                 f"Marka: {product['brand'] or '-'}",
                 f"Kategoria: {CATEGORIES.get(product['category'], product['category'])}",
                 "",
@@ -598,6 +599,9 @@ async def show_category(callback: CallbackQuery) -> None:
     if category == "liquids":
         await show_liquid_brands(callback)
         return
+    if category == "disposables":
+        await show_disposable_brands(callback)
+        return
     with closing(db()) as conn:
         products = conn.execute(
             """
@@ -670,6 +674,61 @@ async def show_liquid_brand(callback: CallbackQuery) -> None:
 
     rows = [[(product_display_name(p), f"prod:{p['id']}")] for p in products]
     rows.append([("Wróć", "cat:liquids")])
+    await edit_or_answer(callback, f"<b>{brand}</b>", kb(rows))
+
+
+def get_disposable_brands() -> list[str]:
+    with closing(db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(brand), ''), 'Inne') AS brand
+            FROM client_products
+            WHERE category = 'disposables' AND quantity > 0 AND is_active = 1
+            GROUP BY COALESCE(NULLIF(TRIM(brand), ''), 'Inne')
+            ORDER BY brand
+            """
+        ).fetchall()
+    return [row["brand"] for row in rows]
+
+
+async def show_disposable_brands(callback: CallbackQuery) -> None:
+    brands = get_disposable_brands()
+    if not brands:
+        await edit_or_answer(callback, "W tej kategorii nie ma teraz produktów.", catalog_menu())
+        return
+
+    rows = [[(brand, f"dispbrand:{index}")] for index, brand in enumerate(brands)]
+    rows.append([("Wróć", "catalog")])
+    await edit_or_answer(callback, "<b>Jednorazówki</b>\nWybierz markę:", kb(rows))
+
+
+async def show_disposable_brand(callback: CallbackQuery) -> None:
+    brand_index = int(callback.data.split(":", 1)[1])
+    brands = get_disposable_brands()
+    if brand_index < 0 or brand_index >= len(brands):
+        await show_disposable_brands(callback)
+        return
+    brand = brands[brand_index]
+    with closing(db()) as conn:
+        products = conn.execute(
+            """
+            SELECT *
+            FROM client_products
+            WHERE category = 'disposables'
+              AND COALESCE(NULLIF(TRIM(brand), ''), 'Inne') = ?
+              AND quantity > 0
+              AND is_active = 1
+            ORDER BY flavor, strength, puffs
+            """,
+            (brand,),
+        ).fetchall()
+
+    if not products:
+        await show_disposable_brands(callback)
+        return
+
+    rows = [[(p["flavor"] or product_display_name(p), f"prod:{p['id']}")] for p in products]
+    rows.append([("Wróć", "cat:disposables")])
     await edit_or_answer(callback, f"<b>{brand}</b>", kb(rows))
 
 
@@ -2223,6 +2282,7 @@ async def main() -> None:
     dp.callback_query.register(show_catalog, F.data == "catalog")
     dp.callback_query.register(show_category, F.data.startswith("cat:"))
     dp.callback_query.register(show_liquid_brand, F.data.startswith("liqbrand:"))
+    dp.callback_query.register(show_disposable_brand, F.data.startswith("dispbrand:"))
     dp.callback_query.register(show_accessory_type, F.data.startswith("acc:"))
     dp.callback_query.register(show_product, F.data.startswith("prod:"))
     dp.callback_query.register(add_to_cart, F.data.startswith("cart:add:"))
