@@ -477,6 +477,33 @@ def get_cart_items(user_id: int) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def resolve_user_reference(raw_value: str) -> tuple[int, str, str]:
+    value = raw_value.strip().lstrip("@")
+    if value.isdigit():
+        return int(value), "", "Zamówienie niestandardowe"
+
+    with closing(db()) as conn:
+        user = conn.execute(
+            """
+            SELECT user_id, username, full_name
+            FROM (
+                SELECT user_id, username, full_name, created_at FROM orders
+                UNION ALL
+                SELECT user_id, username, full_name, created_at FROM customers
+            )
+            WHERE LOWER(username) = LOWER(?)
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (value,),
+        ).fetchone()
+    if not user:
+        raise ValueError(
+            "Nie znam jeszcze tego username. Podaj Telegram ID albo poproś klienta, żeby najpierw uruchomił bota."
+        )
+    return int(user["user_id"]), user["username"] or value, user["full_name"] or user["username"] or value
+
+
 class AddProduct(StatesGroup):
     product_type = State()
     accessory_type = State()
@@ -518,6 +545,10 @@ class StockEdit(StatesGroup):
 
 class OrderPriceEdit(StatesGroup):
     amount = State()
+
+
+class OrderDelete(StatesGroup):
+    order_id = State()
 
 
 @dataclass
@@ -634,6 +665,28 @@ def get_liquid_brands() -> list[str]:
             """
         ).fetchall()
     return [row["brand"] for row in rows]
+
+
+def normalized_brand(product: sqlite3.Row | dict) -> str:
+    brand = (product["brand"] or "").strip()
+    return brand or "Inne"
+
+
+def brand_callback(prefix: str, brands: list[str], brand: str, fallback: str) -> str:
+    try:
+        return f"{prefix}:{brands.index(brand)}"
+    except ValueError:
+        return fallback
+
+
+def product_back_callback(product: sqlite3.Row) -> str:
+    if product["category"] == "liquids":
+        return brand_callback("liqbrand", get_liquid_brands(), normalized_brand(product), "cat:liquids")
+    if product["category"] == "disposables":
+        return brand_callback("dispbrand", get_disposable_brands(), normalized_brand(product), "cat:disposables")
+    if product["category"] == "accessories" and product["accessory_type"]:
+        return f"acc:{product['accessory_type']}"
+    return f"cat:{product['category']}"
 
 
 async def show_liquid_brands(callback: CallbackQuery) -> None:
@@ -772,7 +825,7 @@ async def show_product(callback: CallbackQuery) -> None:
     markup = kb(
         [
             [("Dodaj do koszyka", f"cart:add:{product_id}")],
-            [("Wróć", f"cat:{product['category']}")],
+            [("Wróć", product_back_callback(product))],
         ]
     )
     if product["photo_file_id"]:
@@ -1777,17 +1830,20 @@ async def custom_order_start(callback: CallbackQuery, state: FSMContext, admin_i
         return
     await state.clear()
     await state.set_state(CustomOrder.user_id)
-    await callback.message.answer("Podaj Telegram ID klienta dla zamówienia niestandardowego.")
+    await callback.message.answer(
+        "Podaj Telegram ID albo username klienta dla zamówienia niestandardowego.\n\n"
+        "Przykład:\n123456789\nalbo\nBogdan_Diac"
+    )
     await answer_callback(callback)
 
 
 async def custom_order_user(message: Message, state: FSMContext) -> None:
     try:
-        user_id = int(message.text.strip())
-    except (TypeError, ValueError):
-        await message.answer("Podaj poprawny Telegram ID, np. 123456789.")
+        user_id, username, full_name = resolve_user_reference(message.text)
+    except ValueError as exc:
+        await message.answer(str(exc))
         return
-    await state.update_data(user_id=user_id)
+    await state.update_data(user_id=user_id, username=username, full_name=full_name)
     await state.set_state(CustomOrder.items)
     await message.answer(
         "Podaj produkty w formacie ID:ILOŚĆ, oddzielone przecinkami.\n"
@@ -1869,6 +1925,8 @@ async def custom_order_total(message: Message, state: FSMContext, bot: Bot) -> N
             return
 
     user_id = int(data["user_id"])
+    username = data.get("username", "")
+    full_name = data.get("full_name", "Zamówienie niestandardowe")
     requested_items = data["items"]
     with closing(db()) as conn:
         try:
@@ -1876,9 +1934,9 @@ async def custom_order_total(message: Message, state: FSMContext, bot: Bot) -> N
             cursor = conn.execute(
                 """
                 INSERT INTO orders (user_id, username, full_name, total, notes, is_custom, status, created_at)
-                VALUES (?, '', 'Zamówienie niestandardowe', ?, ?, 1, 'pending', ?)
+                VALUES (?, ?, ?, ?, ?, 1, 'pending', ?)
                 """,
-                (user_id, float(total), notes, now_iso()),
+                (user_id, username, full_name, float(total), notes, now_iso()),
             )
             order_id = cursor.lastrowid
             liquid_qty = 0
@@ -1947,16 +2005,18 @@ async def custom_order_total(message: Message, state: FSMContext, bot: Bot) -> N
         )
 
 
-async def admin_orders(callback: CallbackQuery, admin_id: int) -> None:
+async def admin_orders(callback: CallbackQuery, admin_id: int, show_all: bool = False) -> None:
     if not await admin_only(callback, admin_id):
         return
     with closing(db()) as conn:
+        total_count = conn.execute("SELECT COUNT(*) AS count FROM orders").fetchone()["count"]
+        limit_sql = "" if show_all else "LIMIT 10"
         orders = conn.execute(
-            """
+            f"""
             SELECT id, full_name, username, total, notes, is_custom, status, created_at
             FROM orders
             ORDER BY id DESC
-            LIMIT 20
+            {limit_sql}
             """
         ).fetchall()
     if not orders:
@@ -1979,6 +2039,9 @@ async def admin_orders(callback: CallbackQuery, admin_id: int) -> None:
                 ]
             )
             rows.append([(f"Zmień cenę #{order['id']}", f"admin:price:{order['id']}")])
+    if not show_all and total_count > 10:
+        rows.append([("Pokaż wszystkie", "admin:orders:all")])
+    rows.append([("Usuń zamówienie", "admin:delete_order")])
     rows.append([("Wróć", "admin")])
     await edit_or_answer(callback, "\n".join(lines), kb(rows))
 
@@ -2055,6 +2118,63 @@ async def admin_cancel_order(callback: CallbackQuery, admin_id: int) -> None:
 
     await answer_callback(callback, "Zamówienie anulowane.", show_alert=True)
     await admin_orders(callback, admin_id)
+
+
+def delete_order_by_id(order_id: int) -> None:
+    with closing(db()) as conn:
+        try:
+            conn.execute("BEGIN")
+            order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+            if not order:
+                raise ValueError("Zamówienie nie istnieje.")
+            items = conn.execute("SELECT * FROM order_items WHERE order_id = ?", (order_id,)).fetchall()
+            if order["status"] == "pending":
+                for item in items:
+                    if item["product_id"]:
+                        conn.execute(
+                            """
+                            UPDATE client_products
+                            SET quantity = quantity + ?,
+                                is_active = CASE WHEN quantity + ? > 0 THEN 1 ELSE is_active END
+                            WHERE id = ?
+                            """,
+                            (item["quantity"], item["quantity"], item["product_id"]),
+                        )
+            conn.execute("DELETE FROM customers WHERE order_id = ?", (order_id,))
+            conn.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
+            conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+async def admin_delete_order_start(callback: CallbackQuery, state: FSMContext, admin_id: int) -> None:
+    if not await admin_only(callback, admin_id):
+        return
+    await state.clear()
+    await state.set_state(OrderDelete.order_id)
+    await callback.message.answer("Podaj ID zamówienia, które chcesz usunąć.")
+    await answer_callback(callback)
+
+
+async def save_delete_order(message: Message, state: FSMContext) -> None:
+    try:
+        order_id = int(message.text.strip())
+        if order_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        await message.answer("Podaj poprawne ID zamówienia, np. 15.")
+        return
+
+    try:
+        await asyncio.to_thread(delete_order_by_id, order_id)
+    except Exception as exc:
+        await message.answer(str(exc))
+        return
+
+    await state.clear()
+    await message.answer(f"Zamówienie #{order_id} zostało usunięte.", reply_markup=admin_menu())
 
 
 async def admin_price_start(callback: CallbackQuery, state: FSMContext, admin_id: int) -> None:
@@ -2236,6 +2356,9 @@ async def main() -> None:
     async def admin_orders_handler(callback: CallbackQuery) -> None:
         await admin_orders(callback, config.admin_id)
 
+    async def admin_orders_all_handler(callback: CallbackQuery) -> None:
+        await admin_orders(callback, config.admin_id, show_all=True)
+
     async def custom_order_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await custom_order_start(callback, state, config.admin_id)
 
@@ -2269,6 +2392,9 @@ async def main() -> None:
     async def admin_cancel_order_handler(callback: CallbackQuery) -> None:
         await admin_cancel_order(callback, config.admin_id)
 
+    async def admin_delete_order_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await admin_delete_order_start(callback, state, config.admin_id)
+
     async def admin_price_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await admin_price_start(callback, state, config.admin_id)
 
@@ -2299,6 +2425,8 @@ async def main() -> None:
     dp.callback_query.register(admin_photo_select_handler, F.data.startswith("admin:photo:select:"))
     dp.callback_query.register(admin_list_handler, F.data == "admin:list")
     dp.callback_query.register(admin_orders_handler, F.data == "admin:orders")
+    dp.callback_query.register(admin_orders_all_handler, F.data == "admin:orders:all")
+    dp.callback_query.register(admin_delete_order_start_handler, F.data == "admin:delete_order")
     dp.callback_query.register(custom_order_start_handler, F.data == "admin:custom")
     dp.callback_query.register(admin_stock_list_handler, F.data == "admin:stock")
     dp.callback_query.register(admin_stock_select_handler, F.data.startswith("admin:stock:select:"))
@@ -2334,6 +2462,7 @@ async def main() -> None:
     dp.message.register(save_product_photo, ProductPhoto.photo)
     dp.message.register(save_stock_quantity, StockEdit.quantity)
     dp.message.register(save_order_price, OrderPriceEdit.amount)
+    dp.message.register(save_delete_order, OrderDelete.order_id)
     dp.message.register(custom_order_user, CustomOrder.user_id)
     dp.message.register(custom_order_items, CustomOrder.items)
     dp.message.register(custom_order_total_handler, CustomOrder.total)
