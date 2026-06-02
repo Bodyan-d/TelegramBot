@@ -595,6 +595,9 @@ async def show_category(callback: CallbackQuery) -> None:
     if category == "accessories":
         await edit_or_answer(callback, "<b>Akcesoria</b>", accessory_menu())
         return
+    if category == "liquids":
+        await show_liquid_brands(callback)
+        return
     with closing(db()) as conn:
         products = conn.execute(
             """
@@ -613,6 +616,61 @@ async def show_category(callback: CallbackQuery) -> None:
     rows = [[(product_display_name(p), f"prod:{p['id']}")] for p in products]
     rows.append([("Wróć", "catalog")])
     await edit_or_answer(callback, f"<b>{CATEGORIES[category]}</b>", kb(rows))
+
+
+def get_liquid_brands() -> list[str]:
+    with closing(db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(brand), ''), 'Inne') AS brand
+            FROM client_products
+            WHERE category = 'liquids' AND quantity > 0 AND is_active = 1
+            GROUP BY COALESCE(NULLIF(TRIM(brand), ''), 'Inne')
+            ORDER BY brand
+            """
+        ).fetchall()
+    return [row["brand"] for row in rows]
+
+
+async def show_liquid_brands(callback: CallbackQuery) -> None:
+    brands = get_liquid_brands()
+    if not brands:
+        await edit_or_answer(callback, "W tej kategorii nie ma teraz produktów.", catalog_menu())
+        return
+
+    rows = [[(brand, f"liqbrand:{index}")] for index, brand in enumerate(brands)]
+    rows.append([("Wróć", "catalog")])
+    await edit_or_answer(callback, "<b>Płyny</b>\nWybierz markę:", kb(rows))
+
+
+async def show_liquid_brand(callback: CallbackQuery) -> None:
+    brand_index = int(callback.data.split(":", 1)[1])
+    brands = get_liquid_brands()
+    if brand_index < 0 or brand_index >= len(brands):
+        await show_liquid_brands(callback)
+        return
+    brand = brands[brand_index]
+    with closing(db()) as conn:
+        products = conn.execute(
+            """
+            SELECT *
+            FROM client_products
+            WHERE category = 'liquids'
+              AND COALESCE(NULLIF(TRIM(brand), ''), 'Inne') = ?
+              AND quantity > 0
+              AND is_active = 1
+            ORDER BY name, strength
+            """,
+            (brand,),
+        ).fetchall()
+
+    if not products:
+        await show_liquid_brands(callback)
+        return
+
+    rows = [[(product_display_name(p), f"prod:{p['id']}")] for p in products]
+    rows.append([("Wróć", "cat:liquids")])
+    await edit_or_answer(callback, f"<b>{brand}</b>", kb(rows))
 
 
 async def show_accessory_type(callback: CallbackQuery) -> None:
@@ -1822,8 +1880,12 @@ async def custom_order_total(message: Message, state: FSMContext, bot: Bot) -> N
             f"Kwota: {money(total)}\n"
             "Szczegóły odbioru ustalisz z administratorem.",
         )
-    except Exception:
-        await message.answer("Nie udało się wysłać wiadomości do klienta. Zamówienie jest zapisane w panelu.")
+    except Exception as exc:
+        await message.answer(
+            "Nie udało się wysłać wiadomości do klienta. Zamówienie jest zapisane w panelu.\n\n"
+            "Najczęstszy powód: klient jeszcze nie uruchomił bota przyciskiem Start albo zablokował bota.\n"
+            f"Szczegóły Telegram: <code>{str(exc)}</code>"
+        )
 
 
 async def admin_orders(callback: CallbackQuery, admin_id: int) -> None:
@@ -2160,6 +2222,7 @@ async def main() -> None:
     dp.callback_query.register(menu_handler, F.data == "menu")
     dp.callback_query.register(show_catalog, F.data == "catalog")
     dp.callback_query.register(show_category, F.data.startswith("cat:"))
+    dp.callback_query.register(show_liquid_brand, F.data.startswith("liqbrand:"))
     dp.callback_query.register(show_accessory_type, F.data.startswith("acc:"))
     dp.callback_query.register(show_product, F.data.startswith("prod:"))
     dp.callback_query.register(add_to_cart, F.data.startswith("cart:add:"))
