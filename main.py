@@ -578,7 +578,10 @@ async def edit_or_answer(callback: CallbackQuery, text: str, markup: InlineKeybo
         try:
             await callback.message.edit_text(text, reply_markup=markup)
         except TelegramBadRequest:
-            await callback.message.delete()
+            try:
+                await callback.message.delete()
+            except TelegramBadRequest:
+                pass
             await callback.message.answer(text, reply_markup=markup)
     await answer_callback(callback)
 
@@ -1657,7 +1660,7 @@ async def admin_stock_list(callback: CallbackQuery, state: FSMContext, admin_id:
     with closing(db()) as conn:
         products = conn.execute(
             """
-            SELECT id, name, category, accessory_type, volume, resistance, quantity
+            SELECT *
             FROM warehouse_products
             ORDER BY category, name, volume, resistance
             """
@@ -1667,10 +1670,14 @@ async def admin_stock_list(callback: CallbackQuery, state: FSMContext, admin_id:
         await edit_or_answer(callback, "Brak produktów do edycji ilości.", admin_menu())
         return
 
-    rows = [
-        [(f"{product_display_name(p)} ({p['quantity']} szt.)", f"admin:stock:select:{p['id']}")]
-        for p in products
-    ]
+    try:
+        rows = [
+            [(f"{product_display_name(p)} ({p['quantity']} szt.)", f"admin:stock:select:{p['id']}")]
+            for p in products
+        ]
+    except Exception as exc:
+        await edit_or_answer(callback, f"Nie udało się zbudować listy produktów:\n<code>{exc}</code>", admin_menu())
+        return
     rows.append([("Wróć", "admin")])
     await edit_or_answer(callback, "Wybierz produkt do zmiany ilości:", kb(rows))
 
