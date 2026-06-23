@@ -321,9 +321,9 @@ def two_line_button_text(first_line: str, second_line: str = "", max_first_line:
 def admin_product_button_text(product: sqlite3.Row, quantity: int | None = None, prefix: str = "") -> str:
     qty = f"{quantity if quantity is not None else product['quantity']} szt."
     if product["category"] == "liquids":
-        second = f"Marka: {product['brand'] or '-'} | {qty}"
-        return two_line_button_text(f"{prefix}{product['name']}", second)
-    return two_line_button_text(f"{prefix}{product_display_name(product)}", qty)
+        brand = product["brand"] or "-"
+        return f"{prefix}{brand} | {product['name']} | {qty}"
+    return f"{prefix}{product_display_name(product)} | {qty}"
 
 
 def admin_product_text_line(product: sqlite3.Row, quantity: int | None = None) -> str:
