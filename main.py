@@ -326,6 +326,13 @@ def admin_product_button_text(product: sqlite3.Row, quantity: int | None = None,
     return two_line_button_text(f"{prefix}{product_display_name(product)}", qty)
 
 
+def admin_product_text_line(product: sqlite3.Row, quantity: int | None = None) -> str:
+    qty = quantity if quantity is not None else product["quantity"]
+    if product["category"] == "liquids":
+        return f"#{product['id']} {product['name']}\nMarka: {product['brand'] or '-'} | Ilość: {qty} szt."
+    return f"#{product['id']} {product_display_name(product)}\nIlość: {qty} szt."
+
+
 def user_link(user_id: int, label: str) -> str:
     safe_label = label.replace("<", "").replace(">", "")
     return f'<a href="tg://user?id={user_id}">{safe_label}</a>'
@@ -1773,7 +1780,11 @@ async def admin_availability(callback: CallbackQuery, admin_id: int) -> None:
         for p in products
     ]
     rows.append([("Wróć", "admin")])
-    await edit_or_answer(callback, "Zmień dostępność klienta:", kb(rows))
+    lines = ["<b>Zmień dostępność klienta</b>"]
+    for product in products:
+        status = "aktywne" if product["is_active"] else "ukryte"
+        lines.append(f"{admin_product_text_line(product)} | {status}")
+    await edit_or_answer(callback, "\n\n".join(lines), kb(rows))
 
 
 async def admin_toggle(callback: CallbackQuery, admin_id: int) -> None:
@@ -1817,7 +1828,10 @@ async def admin_stock_list(callback: CallbackQuery, state: FSMContext, admin_id:
         await edit_or_answer(callback, f"Nie udało się zbudować listy produktów:\n<code>{exc}</code>", admin_menu())
         return
     rows.append([("Wróć", "admin")])
-    await edit_or_answer(callback, "Wybierz produkt do zmiany ilości:", kb(rows))
+    lines = ["<b>Wybierz produkt do zmiany ilości</b>"]
+    for product in products:
+        lines.append(admin_product_text_line(product))
+    await edit_or_answer(callback, "\n\n".join(lines), kb(rows))
 
 
 async def admin_stock_select(callback: CallbackQuery, state: FSMContext, admin_id: int) -> None:
