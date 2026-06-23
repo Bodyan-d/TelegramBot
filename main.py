@@ -1908,10 +1908,23 @@ async def admin_delete_list(callback: CallbackQuery, admin_id: int) -> None:
             """
             SELECT
                 w.id AS warehouse_id,
+                w.id AS id,
                 w.name,
+                w.brand,
+                w.category,
+                w.accessory_type,
                 w.flavor,
+                w.description,
+                w.photo_file_id,
+                w.volume,
+                w.resistance,
+                w.compatibility,
+                w.puffs,
                 w.strength,
+                w.price,
+                w.is_active,
                 w.quantity AS warehouse_quantity,
+                w.quantity,
                 COALESCE(c.quantity, 0) AS client_quantity
             FROM warehouse_products w
             LEFT JOIN client_products c ON c.warehouse_product_id = w.id
@@ -1926,14 +1939,17 @@ async def admin_delete_list(callback: CallbackQuery, admin_id: int) -> None:
     rows = [
         [
             (
-                f"{p['name']} | {p['flavor'] or '-'} | skład {p['warehouse_quantity']} / klient {p['client_quantity']}",
+                admin_product_button_text(p, quantity=p["warehouse_quantity"], prefix="Usuń: "),
                 f"admin:delete:confirm:{p['warehouse_id']}",
             )
         ]
         for p in products
     ]
     rows.append([("Wróć", "admin")])
-    await edit_or_answer(callback, "Wybierz produkt do całkowitego usunięcia:", kb(rows))
+    lines = ["<b>Wybierz produkt do całkowitego usunięcia</b>"]
+    for product in products:
+        lines.append(f"{admin_product_text_line(product, product['warehouse_quantity'])}\nKlient: {product['client_quantity']} szt.")
+    await edit_or_answer(callback, "\n\n".join(lines), kb(rows))
 
 
 async def admin_delete_confirm(callback: CallbackQuery, admin_id: int) -> None:
