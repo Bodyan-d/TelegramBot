@@ -25,6 +25,7 @@ from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, Inlin
 
 DB_PATH = BASE_DIR / "shop.sqlite3"
 MAX_CLIENT_ORDER_ITEMS = 7
+ORDERS_PAGE_SIZE = 10
 LIQUID_DISCOUNT_MIN_QTY = 3
 LIQUID_DISCUSS_MIN_QTY = 6
 LIQUID_DISCOUNT_PRICE = Decimal("40")
@@ -221,6 +222,7 @@ def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 def order_admin_keyboard(order_id: int, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text=f"Szczegóły #{order_id}", callback_data=f"admin:order_detail:{order_id}:0")],
             [
                 InlineKeyboardButton(text="Oznacz jako wydane", callback_data=f"admin:issue:{order_id}"),
                 InlineKeyboardButton(text="Anuluj", callback_data=f"admin:cancel_order:{order_id}"),
@@ -408,8 +410,9 @@ def pricing_note(items: list[sqlite3.Row]) -> str:
 def cart_item_text(index: int, item: sqlite3.Row, unit_price: Decimal) -> str:
     quantity = item["cart_quantity"]
     if item["category"] == "liquids":
+        brand = f" | Marka: {item['brand']}" if item["brand"] else ""
         return (
-            f"{index}. {item['name']} | {item['strength'] or '-'} | "
+            f"{index}. {item['name']}{brand} | {item['strength'] or '-'} | "
             f"x{quantity} - {money(unit_price)}"
         )
     if item["category"] == "accessories" and item["accessory_type"] == "pods":
@@ -436,8 +439,9 @@ def admin_product_list_line(product: sqlite3.Row) -> str:
             f"{money(product['price'])} | {product['quantity']} szt. | {status}"
         )
     if product["category"] == "liquids":
+        brand = product["brand"] or "-"
         return (
-            f"#{product['id']} {product['name']} | Płyny | {product['strength'] or '-'} | "
+            f"#{product['id']} {product['name']} | Marka: {brand} | Płyny | {product['strength'] or '-'} | "
             f"{money(product['price'])} | {product['quantity']} szt. | {status}"
         )
     return (
@@ -611,6 +615,17 @@ async def show_catalog(callback: CallbackQuery) -> None:
             GROUP BY category
             """
         ).fetchall()
+        liquid_brands = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(brand), ''), '-') AS brand,
+                   COUNT(*) AS count,
+                   SUM(quantity) AS quantity
+            FROM client_products
+            WHERE category = 'liquids' AND quantity > 0 AND is_active = 1
+            GROUP BY COALESCE(NULLIF(TRIM(brand), ''), '-')
+            ORDER BY brand
+            """
+        ).fetchall()
 
     if products:
         lines = ["<b>Pełna dostępność</b>"]
@@ -619,6 +634,9 @@ async def show_catalog(callback: CallbackQuery) -> None:
                 f"{CATEGORIES.get(row['category'], row['category'])}: "
                 f"{row['quantity'] or 0} szt. w {row['count']} pozycjach"
             )
+            if row["category"] == "liquids" and liquid_brands:
+                for brand in liquid_brands:
+                    lines.append(f"  - {brand['brand']}: {brand['quantity'] or 0} szt. w {brand['count']} pozycjach")
         text = "\n".join(lines)
     else:
         text = "Brak aktywnych produktów w dostępności."
@@ -1467,6 +1485,105 @@ def insert_product_pair(payload: dict) -> int:
     quantity = int(payload["quantity"])
     is_active = 1 if quantity > 0 else 0
     with closing(db()) as conn:
+        if payload["category"] == "liquids":
+            existing = conn.execute(
+                """
+                SELECT *
+                FROM warehouse_products
+                WHERE category = 'liquids'
+                  AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                  AND LOWER(TRIM(brand)) = LOWER(TRIM(?))
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (payload["name"], payload["brand"]),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE warehouse_products
+                    SET flavor = ?,
+                        description = ?,
+                        photo_file_id = COALESCE(NULLIF(?, ''), photo_file_id),
+                        strength = ?,
+                        price = ?,
+                        quantity = quantity + ?,
+                        is_active = CASE WHEN quantity + ? > 0 THEN 1 ELSE 0 END
+                    WHERE id = ?
+                    """,
+                    (
+                        payload["flavor"],
+                        payload["description"],
+                        payload["photo_file_id"],
+                        payload["strength"],
+                        payload["price"],
+                        quantity,
+                        quantity,
+                        existing["id"],
+                    ),
+                )
+                client = conn.execute(
+                    "SELECT * FROM client_products WHERE warehouse_product_id = ?",
+                    (existing["id"],),
+                ).fetchone()
+                if client:
+                    conn.execute(
+                        """
+                        UPDATE client_products
+                        SET name = ?,
+                            brand = ?,
+                            flavor = ?,
+                            description = ?,
+                            photo_file_id = COALESCE(NULLIF(?, ''), photo_file_id),
+                            strength = ?,
+                            price = ?,
+                            quantity = quantity + ?,
+                            is_active = CASE WHEN quantity + ? > 0 THEN 1 ELSE 0 END
+                        WHERE id = ?
+                        """,
+                        (
+                            payload["name"],
+                            payload["brand"],
+                            payload["flavor"],
+                            payload["description"],
+                            payload["photo_file_id"],
+                            payload["strength"],
+                            payload["price"],
+                            quantity,
+                            quantity,
+                            client["id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO client_products
+                        (warehouse_product_id, name, brand, category, accessory_type, flavor, description, photo_file_id, volume, resistance, compatibility, puffs, strength, price, quantity, is_active, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            existing["id"],
+                            payload["name"],
+                            payload["brand"],
+                            payload["category"],
+                            payload["accessory_type"],
+                            payload["flavor"],
+                            payload["description"],
+                            payload["photo_file_id"],
+                            payload["volume"],
+                            payload["resistance"],
+                            payload["compatibility"],
+                            payload["puffs"],
+                            payload["strength"],
+                            payload["price"],
+                            quantity,
+                            is_active,
+                            now_iso(),
+                        ),
+                    )
+                conn.commit()
+                return existing["id"]
+
         cursor = conn.execute(
             """
             INSERT INTO warehouse_products
@@ -2012,25 +2129,95 @@ async def custom_order_total(message: Message, state: FSMContext, bot: Bot) -> N
         )
 
 
-async def admin_orders(callback: CallbackQuery, admin_id: int, show_all: bool = False) -> None:
+def order_item_line(index: int, item: sqlite3.Row) -> str:
+    unit_price = Decimal(str(item["price"]))
+    brand = f" | Marka: {item['brand']}" if item["brand"] else ""
+    if item["category"] == "liquids":
+        return (
+            f"{index}. {item['name']}{brand} | Moc: {item['strength'] or '-'} | "
+            f"x{item['quantity']} | {money(unit_price)} / szt."
+        )
+    if item["category"] == "disposables":
+        flavor = f" | Smak: {item['flavor']}" if item["flavor"] else ""
+        return f"{index}. {item['name']}{brand}{flavor} | x{item['quantity']} | {money(unit_price)} / szt."
+    return f"{index}. {item['name']}{brand} | x{item['quantity']} | {money(unit_price)} / szt."
+
+
+def order_detail_text(order: sqlite3.Row, items: list[sqlite3.Row]) -> str:
+    lines = [
+        f"<b>Zamówienie #{order['id']}</b>",
+        f"Klient: {user_link(order['user_id'], order['full_name'])} (@{order['username'] or '-'})",
+        f"Telegram ID: <code>{order['user_id']}</code>",
+        f"Status: {order['status']}",
+        f"Typ: {'custom' if order['is_custom'] else 'standard'}",
+        f"Suma: <b>{money(order['total'])}</b>",
+        f"Data: {order['created_at']}",
+    ]
+    if order["notes"]:
+        lines.append(f"Notatka: {order['notes']}")
+    lines.extend(["", "<b>Produkty</b>"])
+    if items:
+        for index, item in enumerate(items, start=1):
+            lines.append(order_item_line(index, item))
+    else:
+        lines.append("Brak produktów w zamówieniu.")
+    return "\n".join(lines)
+
+
+def order_detail_keyboard(order: sqlite3.Row, page: int) -> InlineKeyboardMarkup:
+    rows = []
+    if order["status"] == "pending":
+        rows.append(
+            [
+                (f"Wydane #{order['id']}", f"admin:issue:{order['id']}"),
+                (f"Anuluj #{order['id']}", f"admin:cancel_order:{order['id']}"),
+            ]
+        )
+        rows.append([(f"Zmień cenę #{order['id']}", f"admin:price:{order['id']}")])
+    rows.append([("Wróć do zamówień", f"admin:orders:page:{page}")])
+    return kb(rows)
+
+
+async def admin_order_detail(callback: CallbackQuery, admin_id: int) -> None:
     if not await admin_only(callback, admin_id):
         return
+    parts = callback.data.split(":")
+    order_id = int(parts[2])
+    page = int(parts[3]) if len(parts) > 3 else 0
+    with closing(db()) as conn:
+        order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        items = conn.execute("SELECT * FROM order_items WHERE order_id = ? ORDER BY id", (order_id,)).fetchall()
+    if not order:
+        await answer_callback(callback, "Zamówienie nie istnieje.", show_alert=True)
+        return
+    await edit_or_answer(callback, order_detail_text(order, items), order_detail_keyboard(order, page))
+
+
+async def admin_orders(callback: CallbackQuery, admin_id: int, page: int = 0) -> None:
+    if not await admin_only(callback, admin_id):
+        return
+    page = max(page, 0)
+    offset = page * ORDERS_PAGE_SIZE
     with closing(db()) as conn:
         total_count = conn.execute("SELECT COUNT(*) AS count FROM orders").fetchone()["count"]
-        limit_sql = "" if show_all else "LIMIT 10"
+        if total_count and offset >= total_count:
+            page = max((total_count - 1) // ORDERS_PAGE_SIZE, 0)
+            offset = page * ORDERS_PAGE_SIZE
         orders = conn.execute(
-            f"""
+            """
             SELECT id, full_name, username, total, notes, is_custom, status, created_at
             FROM orders
             ORDER BY id DESC
-            {limit_sql}
-            """
+            LIMIT ? OFFSET ?
+            """,
+            (ORDERS_PAGE_SIZE, offset),
         ).fetchall()
     if not orders:
         await edit_or_answer(callback, "Brak zamówień.", admin_menu())
         return
     rows = []
-    lines = ["<b>Zamówienia</b>"]
+    total_pages = max((total_count + ORDERS_PAGE_SIZE - 1) // ORDERS_PAGE_SIZE, 1)
+    lines = [f"<b>Zamówienia</b> | strona {page + 1}/{total_pages}"]
     for order in orders:
         lines.append(
             f"#{order['id']} | {order['full_name']} (@{order['username'] or '-'}) | "
@@ -2038,6 +2225,7 @@ async def admin_orders(callback: CallbackQuery, admin_id: int, show_all: bool = 
         )
         if order["notes"]:
             lines.append(f"Notatka: {order['notes']}")
+        rows.append([(f"#{order['id']} Szczegóły", f"admin:order_detail:{order['id']}:{page}")])
         if order["status"] == "pending":
             rows.append(
                 [
@@ -2046,8 +2234,14 @@ async def admin_orders(callback: CallbackQuery, admin_id: int, show_all: bool = 
                 ]
             )
             rows.append([(f"Zmień cenę #{order['id']}", f"admin:price:{order['id']}")])
-    if not show_all and total_count > 10:
-        rows.append([("Pokaż wszystkie", "admin:orders:all")])
+    nav = []
+    if page > 0:
+        nav.append(("⬅️ Wstecz", f"admin:orders:page:{page - 1}"))
+        nav.append(("Pierwsza", "admin:orders:page:0"))
+    if offset + ORDERS_PAGE_SIZE < total_count:
+        nav.append(("Dalej ➡️", f"admin:orders:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([("Usuń zamówienie", "admin:delete_order")])
     rows.append([("Wróć", "admin")])
     await edit_or_answer(callback, "\n".join(lines), kb(rows))
@@ -2363,8 +2557,11 @@ async def main() -> None:
     async def admin_orders_handler(callback: CallbackQuery) -> None:
         await admin_orders(callback, config.admin_id)
 
-    async def admin_orders_all_handler(callback: CallbackQuery) -> None:
-        await admin_orders(callback, config.admin_id, show_all=True)
+    async def admin_orders_page_handler(callback: CallbackQuery) -> None:
+        await admin_orders(callback, config.admin_id, int(callback.data.split(":")[3]))
+
+    async def admin_order_detail_handler(callback: CallbackQuery) -> None:
+        await admin_order_detail(callback, config.admin_id)
 
     async def custom_order_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await custom_order_start(callback, state, config.admin_id)
@@ -2432,7 +2629,8 @@ async def main() -> None:
     dp.callback_query.register(admin_photo_select_handler, F.data.startswith("admin:photo:select:"))
     dp.callback_query.register(admin_list_handler, F.data == "admin:list")
     dp.callback_query.register(admin_orders_handler, F.data == "admin:orders")
-    dp.callback_query.register(admin_orders_all_handler, F.data == "admin:orders:all")
+    dp.callback_query.register(admin_orders_page_handler, F.data.startswith("admin:orders:page:"))
+    dp.callback_query.register(admin_order_detail_handler, F.data.startswith("admin:order_detail:"))
     dp.callback_query.register(admin_delete_order_start_handler, F.data == "admin:delete_order")
     dp.callback_query.register(custom_order_start_handler, F.data == "admin:custom")
     dp.callback_query.register(admin_stock_list_handler, F.data == "admin:stock")
