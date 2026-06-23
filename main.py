@@ -305,6 +305,27 @@ def product_display_name(product: sqlite3.Row | dict) -> str:
     return product["name"]
 
 
+def two_line_button_text(first_line: str, second_line: str = "", max_first_line: int = 34) -> str:
+    first_line = (first_line or "").strip()
+    second_line = (second_line or "").strip()
+    if second_line:
+        return f"{first_line}\n{second_line}"
+    if len(first_line) <= max_first_line:
+        return first_line
+    split_at = first_line.rfind(" ", 0, max_first_line)
+    if split_at <= 0:
+        split_at = max_first_line
+    return f"{first_line[:split_at].strip()}\n{first_line[split_at:].strip()}"
+
+
+def admin_product_button_text(product: sqlite3.Row, quantity: int | None = None, prefix: str = "") -> str:
+    qty = f"{quantity if quantity is not None else product['quantity']} szt."
+    if product["category"] == "liquids":
+        second = f"Marka: {product['brand'] or '-'} | {qty}"
+        return two_line_button_text(f"{prefix}{product['name']}", second)
+    return two_line_button_text(f"{prefix}{product_display_name(product)}", qty)
+
+
 def user_link(user_id: int, label: str) -> str:
     safe_label = label.replace("<", "").replace(">", "")
     return f'<a href="tg://user?id={user_id}">{safe_label}</a>'
@@ -1737,7 +1758,7 @@ async def admin_availability(callback: CallbackQuery, admin_id: int) -> None:
         return
     with closing(db()) as conn:
         products = conn.execute(
-            "SELECT id, name, flavor, quantity, is_active FROM client_products ORDER BY category, name"
+            "SELECT * FROM client_products ORDER BY category, name"
         ).fetchall()
     if not products:
         await edit_or_answer(callback, "Brak produktów do edycji.", admin_menu())
@@ -1745,7 +1766,7 @@ async def admin_availability(callback: CallbackQuery, admin_id: int) -> None:
     rows = [
         [
             (
-                f"{'Ukryj' if p['is_active'] else 'Pokaż'}: {p['name']} ({p['quantity']})",
+                admin_product_button_text(p, prefix=f"{'Ukryj' if p['is_active'] else 'Pokaż'}: "),
                 f"admin:toggle:{p['id']}",
             )
         ]
@@ -1789,7 +1810,7 @@ async def admin_stock_list(callback: CallbackQuery, state: FSMContext, admin_id:
 
     try:
         rows = [
-            [(f"{product_display_name(p)} ({p['quantity']} szt.)", f"admin:stock:select:{p['id']}")]
+            [(admin_product_button_text(p), f"admin:stock:select:{p['id']}")]
             for p in products
         ]
     except Exception as exc:
@@ -1814,8 +1835,11 @@ async def admin_stock_select(callback: CallbackQuery, state: FSMContext, admin_i
 
     await state.update_data(warehouse_product_id=warehouse_id)
     await state.set_state(StockEdit.quantity)
+    product_name = product_display_name(product)
+    if product["category"] == "liquids" and product["brand"]:
+        product_name = f"{product['name']}\nMarka: {product['brand']}"
     await callback.message.answer(
-        f"Podaj nową aktualną ilość dla produktu:\n<b>{product_display_name(product)}</b>\n\n"
+        f"Podaj nową aktualną ilość dla produktu:\n<b>{product_name}</b>\n\n"
         f"Obecnie: {product['quantity']} szt."
     )
     await answer_callback(callback)
@@ -1853,8 +1877,11 @@ async def save_stock_quantity(message: Message, state: FSMContext) -> None:
         conn.commit()
 
     await state.clear()
+    product_name = product_display_name(product)
+    if product["category"] == "liquids" and product["brand"]:
+        product_name = f"{product['name']} | Marka: {product['brand']}"
     await message.answer(
-        f"Ilość została zaktualizowana.\n\n{product_display_name(product)}: {quantity} szt.",
+        f"Ilość została zaktualizowana.\n\n{product_name}: {quantity} szt.",
         reply_markup=admin_menu(),
     )
 
@@ -2215,25 +2242,8 @@ async def admin_orders(callback: CallbackQuery, admin_id: int, page: int = 0) ->
     if not orders:
         await edit_or_answer(callback, "Brak zamówień.", admin_menu())
         return
-    rows = []
     total_pages = max((total_count + ORDERS_PAGE_SIZE - 1) // ORDERS_PAGE_SIZE, 1)
-    lines = [f"<b>Zamówienia</b> | strona {page + 1}/{total_pages}"]
-    for order in orders:
-        lines.append(
-            f"#{order['id']} | {order['full_name']} (@{order['username'] or '-'}) | "
-            f"{money(order['total'])} | {'custom' if order['is_custom'] else 'standard'} | {order['status']} | {order['created_at']}"
-        )
-        if order["notes"]:
-            lines.append(f"Notatka: {order['notes']}")
-        rows.append([(f"#{order['id']} Szczegóły", f"admin:order_detail:{order['id']}:{page}")])
-        if order["status"] == "pending":
-            rows.append(
-                [
-                    (f"Wydane #{order['id']}", f"admin:issue:{order['id']}"),
-                    (f"Anuluj #{order['id']}", f"admin:cancel_order:{order['id']}"),
-                ]
-            )
-            rows.append([(f"Zmień cenę #{order['id']}", f"admin:price:{order['id']}")])
+    rows = []
     nav = []
     if page > 0:
         nav.append(("⬅️ Wstecz", f"admin:orders:page:{page - 1}"))
@@ -2242,6 +2252,27 @@ async def admin_orders(callback: CallbackQuery, admin_id: int, page: int = 0) ->
         nav.append(("Dalej ➡️", f"admin:orders:page:{page + 1}"))
     if nav:
         rows.append(nav)
+
+    detail_buttons = [(f"#{order['id']}", f"admin:order_detail:{order['id']}:{page}") for order in orders]
+    for index in range(0, len(detail_buttons), 5):
+        rows.append(detail_buttons[index : index + 5])
+
+    lines = [f"<b>Zamówienia</b> | strona {page + 1}/{total_pages}"]
+    for order in orders:
+        lines.append(
+            f"#{order['id']} | {order['full_name']} (@{order['username'] or '-'}) | "
+            f"{money(order['total'])} | {'custom' if order['is_custom'] else 'standard'} | {order['status']} | {order['created_at']}"
+        )
+        if order["notes"]:
+            lines.append(f"Notatka: {order['notes']}")
+        if order["status"] == "pending":
+            rows.append(
+                [
+                    (f"Wydane #{order['id']}", f"admin:issue:{order['id']}"),
+                    (f"Anuluj #{order['id']}", f"admin:cancel_order:{order['id']}"),
+                ]
+            )
+            rows.append([(f"Zmień cenę #{order['id']}", f"admin:price:{order['id']}")])
     rows.append([("Usuń zamówienie", "admin:delete_order")])
     rows.append([("Wróć", "admin")])
     await edit_or_answer(callback, "\n".join(lines), kb(rows))
