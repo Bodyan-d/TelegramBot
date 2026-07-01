@@ -26,6 +26,8 @@ from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, Inlin
 DB_PATH = BASE_DIR / "shop.sqlite3"
 MAX_CLIENT_ORDER_ITEMS = 7
 ORDERS_PAGE_SIZE = 10
+ADDITIONAL_ADMIN_IDS = (8863682356,)
+SUPPORT_ADMIN_ID = 8863682356
 LIQUID_DISCOUNT_MIN_QTY = 3
 LIQUID_DISCUSS_MIN_QTY = 6
 LIQUID_DISCOUNT_PRICE = Decimal("40")
@@ -587,6 +589,16 @@ class OrderDelete(StatesGroup):
 class Config:
     bot_token: str
     admin_id: int
+    admin_ids: tuple[int, ...]
+
+
+def parse_admin_ids(raw_value: str) -> list[int]:
+    ids = []
+    for part in raw_value.replace(";", ",").split(","):
+        value = part.strip()
+        if value:
+            ids.append(int(value))
+    return ids
 
 
 def get_config() -> Config:
@@ -595,13 +607,22 @@ def get_config() -> Config:
     admin_id = os.getenv("ADMIN_ID", "").strip()
     if not token or not admin_id:
         raise RuntimeError("Brakuje BOT_TOKEN lub ADMIN_ID w pliku .env.")
-    return Config(bot_token=token, admin_id=int(admin_id))
+    admin_ids = [int(admin_id), *ADDITIONAL_ADMIN_IDS]
+    admin_ids.extend(parse_admin_ids(os.getenv("ADMIN_IDS", "")))
+    unique_admin_ids = tuple(dict.fromkeys(admin_ids))
+    return Config(bot_token=token, admin_id=int(admin_id), admin_ids=unique_admin_ids)
 
 
-async def send_menu(message: Message, admin_id: int) -> None:
+def is_admin_user(user_id: int, admin_ids: int | tuple[int, ...] | list[int] | set[int]) -> bool:
+    if isinstance(admin_ids, int):
+        return user_id == admin_ids
+    return user_id in admin_ids
+
+
+async def send_menu(message: Message, admin_ids: int | tuple[int, ...]) -> None:
     await message.answer(
         "Wybierz opcję:",
-        reply_markup=main_menu(message.from_user.id == admin_id),
+        reply_markup=main_menu(is_admin_user(message.from_user.id, admin_ids)),
     )
 
 
@@ -625,12 +646,12 @@ async def answer_callback(callback: CallbackQuery, *args, **kwargs) -> None:
         pass
 
 
-async def start(message: Message, admin_id: int) -> None:
-    await send_menu(message, admin_id)
+async def start(message: Message, admin_ids: int | tuple[int, ...]) -> None:
+    await send_menu(message, admin_ids)
 
 
-async def menu_callback(callback: CallbackQuery, admin_id: int) -> None:
-    await edit_or_answer(callback, "Wybierz opcję:", main_menu(callback.from_user.id == admin_id))
+async def menu_callback(callback: CallbackQuery, admin_ids: int | tuple[int, ...]) -> None:
+    await edit_or_answer(callback, "Wybierz opcję:", main_menu(is_admin_user(callback.from_user.id, admin_ids)))
 
 
 async def show_catalog(callback: CallbackQuery) -> None:
@@ -1025,7 +1046,7 @@ async def save_quantity(message: Message, state: FSMContext) -> None:
     await message.answer("Koszyk zaktualizowany.", reply_markup=kb([[("Pokaż koszyk", "cart")]]))
 
 
-async def confirm_cart(callback: CallbackQuery, bot: Bot, admin_id: int) -> None:
+async def confirm_cart(callback: CallbackQuery, bot: Bot, admin_ids: int | tuple[int, ...]) -> None:
     items = get_cart_items(callback.from_user.id)
     if not items:
         await answer_callback(callback, "Koszyk jest pusty.", show_alert=True)
@@ -1109,15 +1130,23 @@ async def confirm_cart(callback: CallbackQuery, bot: Bot, admin_id: int) -> None
             return
 
     order_text = cart_text(items).replace("<b>Koszyk</b>", f"<b>Zamówienie #{order_id}</b>")
-    await bot.send_message(
-        admin_id,
+    recipients = (admin_ids,) if isinstance(admin_ids, int) else admin_ids
+    admin_message = (
         "Nowe zamówienie.\n"
         f"Klient: {user_link(callback.from_user.id, callback.from_user.full_name)} "
         f"(@{callback.from_user.username or '-'})\n"
         f"Telegram ID: <code>{callback.from_user.id}</code>\n\n"
-        f"{order_text}",
-        reply_markup=order_admin_keyboard(order_id, callback.from_user.id),
+        f"{order_text}"
     )
+    for admin_id in recipients:
+        try:
+            await bot.send_message(
+                admin_id,
+                admin_message,
+                reply_markup=order_admin_keyboard(order_id, callback.from_user.id),
+            )
+        except Exception:
+            pass
     await edit_or_answer(
         callback,
         f"Zamówienie #{order_id} zostało przyjęte.\nSkontaktujemy się z Tobą w sprawie odbioru.",
@@ -1133,8 +1162,8 @@ async def contact(callback: CallbackQuery, admin_id: int) -> None:
     )
 
 
-async def admin_only(callback: CallbackQuery, admin_id: int) -> bool:
-    if callback.from_user.id != admin_id:
+async def admin_only(callback: CallbackQuery, admin_ids: int | tuple[int, ...]) -> bool:
+    if not is_admin_user(callback.from_user.id, admin_ids):
         await answer_callback(callback, "Brak dostępu.", show_alert=True)
         return False
     return True
@@ -2013,7 +2042,7 @@ async def custom_order_start(callback: CallbackQuery, state: FSMContext, admin_i
     await state.set_state(CustomOrder.user_id)
     await callback.message.answer(
         "Podaj Telegram ID albo username klienta dla zamówienia niestandardowego.\n\n"
-        "Przykład:\n123456789\nalbo\nBogdan_Diac"
+        "Przykład:\n123456789\nalbo\nDuckVape_Manager"
     )
     await answer_callback(callback)
 
@@ -2589,82 +2618,82 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     async def start_handler(message: Message) -> None:
-        await start(message, config.admin_id)
+        await start(message, config.admin_ids)
 
     async def menu_handler(callback: CallbackQuery) -> None:
-        await menu_callback(callback, config.admin_id)
+        await menu_callback(callback, config.admin_ids)
 
     async def confirm_cart_handler(callback: CallbackQuery) -> None:
-        await confirm_cart(callback, bot, config.admin_id)
+        await confirm_cart(callback, bot, config.admin_ids)
 
     async def contact_handler(callback: CallbackQuery) -> None:
-        await contact(callback, config.admin_id)
+        await contact(callback, SUPPORT_ADMIN_ID)
 
     async def show_admin_handler(callback: CallbackQuery) -> None:
-        await show_admin(callback, config.admin_id)
+        await show_admin(callback, config.admin_ids)
 
     async def admin_add_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await admin_add_start(callback, state, config.admin_id)
+        await admin_add_start(callback, state, config.admin_ids)
 
     async def admin_list_handler(callback: CallbackQuery) -> None:
-        await admin_list(callback, config.admin_id)
+        await admin_list(callback, config.admin_ids)
 
     async def admin_photo_list_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await admin_photo_list(callback, state, config.admin_id)
+        await admin_photo_list(callback, state, config.admin_ids)
 
     async def admin_photo_select_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await admin_photo_select(callback, state, config.admin_id)
+        await admin_photo_select(callback, state, config.admin_ids)
 
     async def admin_orders_handler(callback: CallbackQuery) -> None:
-        await admin_orders(callback, config.admin_id)
+        await admin_orders(callback, config.admin_ids)
 
     async def admin_orders_page_handler(callback: CallbackQuery) -> None:
-        await admin_orders(callback, config.admin_id, int(callback.data.split(":")[3]))
+        await admin_orders(callback, config.admin_ids, int(callback.data.split(":")[3]))
 
     async def admin_order_detail_handler(callback: CallbackQuery) -> None:
-        await admin_order_detail(callback, config.admin_id)
+        await admin_order_detail(callback, config.admin_ids)
 
     async def custom_order_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await custom_order_start(callback, state, config.admin_id)
+        await custom_order_start(callback, state, config.admin_ids)
 
     async def custom_order_total_handler(message: Message, state: FSMContext) -> None:
         await custom_order_total(message, state, bot)
 
     async def admin_availability_handler(callback: CallbackQuery) -> None:
-        await admin_availability(callback, config.admin_id)
+        await admin_availability(callback, config.admin_ids)
 
     async def admin_toggle_handler(callback: CallbackQuery) -> None:
-        await admin_toggle(callback, config.admin_id)
+        await admin_toggle(callback, config.admin_ids)
 
     async def admin_stock_list_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await admin_stock_list(callback, state, config.admin_id)
+        await admin_stock_list(callback, state, config.admin_ids)
 
     async def admin_stock_select_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await admin_stock_select(callback, state, config.admin_id)
+        await admin_stock_select(callback, state, config.admin_ids)
 
     async def admin_delete_list_handler(callback: CallbackQuery) -> None:
-        await admin_delete_list(callback, config.admin_id)
+        await admin_delete_list(callback, config.admin_ids)
 
     async def admin_delete_confirm_handler(callback: CallbackQuery) -> None:
-        await admin_delete_confirm(callback, config.admin_id)
+        await admin_delete_confirm(callback, config.admin_ids)
 
     async def admin_delete_do_handler(callback: CallbackQuery) -> None:
-        await admin_delete_do(callback, config.admin_id)
+        await admin_delete_do(callback, config.admin_ids)
 
     async def admin_issue_handler(callback: CallbackQuery) -> None:
-        await admin_issue(callback, config.admin_id)
+        await admin_issue(callback, config.admin_ids)
 
     async def admin_cancel_order_handler(callback: CallbackQuery) -> None:
-        await admin_cancel_order(callback, config.admin_id)
+        await admin_cancel_order(callback, config.admin_ids)
 
     async def admin_delete_order_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await admin_delete_order_start(callback, state, config.admin_id)
+        await admin_delete_order_start(callback, state, config.admin_ids)
 
     async def admin_price_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
-        await admin_price_start(callback, state, config.admin_id)
+        await admin_price_start(callback, state, config.admin_ids)
 
     async def admin_stats_handler(callback: CallbackQuery) -> None:
-        await admin_stats(callback, config.admin_id)
+        await admin_stats(callback, config.admin_ids)
 
     dp.message.register(start_handler, CommandStart())
     dp.message.register(cancel, Command("cancel"))

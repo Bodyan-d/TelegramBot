@@ -52,10 +52,11 @@ Copy-Item .env.example .env
 
 ```env
 ADMIN_ID=123456789
+ADMIN_IDS=8863682356
 BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
 ```
 
-To get your Telegram ID, message a bot such as `@userinfobot`.
+`ADMIN_ID` is the main administrator. `ADMIN_IDS` is a comma-separated list of additional administrators. To get your Telegram ID, message a bot such as `@userinfobot`.
 
 ## Run
 
