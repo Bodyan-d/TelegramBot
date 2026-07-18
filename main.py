@@ -26,6 +26,7 @@ from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, Inlin
 DB_PATH = BASE_DIR / "shop.sqlite3"
 MAX_CLIENT_ORDER_ITEMS = 7
 ORDERS_PAGE_SIZE = 10
+PRODUCT_LIST_PAGE_SIZE = 20
 ADDITIONAL_ADMIN_IDS = (8863682356,)
 SUPPORT_ADMIN_ID = 8863682356
 LIQUID_DISCOUNT_MIN_QTY = 3
@@ -1697,21 +1698,45 @@ def insert_product_pair(payload: dict) -> int:
     return warehouse_id
 
 
-async def admin_list(callback: CallbackQuery, admin_id: int) -> None:
+async def admin_list(callback: CallbackQuery, admin_id: int, page: int = 0) -> None:
     if not await admin_only(callback, admin_id):
         return
+    page = max(page, 0)
+    offset = page * PRODUCT_LIST_PAGE_SIZE
     with closing(db()) as conn:
+        total_count = conn.execute("SELECT COUNT(*) AS count FROM warehouse_products").fetchone()["count"]
+        if total_count and offset >= total_count:
+            page = max((total_count - 1) // PRODUCT_LIST_PAGE_SIZE, 0)
+            offset = page * PRODUCT_LIST_PAGE_SIZE
         products = conn.execute(
-            "SELECT * FROM warehouse_products ORDER BY category, name, flavor, strength"
+            """
+            SELECT *
+            FROM warehouse_products
+            ORDER BY category, name, flavor, strength
+            LIMIT ? OFFSET ?
+            """,
+            (PRODUCT_LIST_PAGE_SIZE, offset),
         ).fetchall()
 
     if not products:
         await edit_or_answer(callback, "Lista produktów jest pusta.", admin_menu())
         return
-    lines = ["<b>Produkty w realnym składzie</b>"]
+    total_pages = max((total_count + PRODUCT_LIST_PAGE_SIZE - 1) // PRODUCT_LIST_PAGE_SIZE, 1)
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(("⬅️ Wstecz", f"admin:list:page:{page - 1}"))
+        nav.append(("Pierwsza", "admin:list:page:0"))
+    if offset + PRODUCT_LIST_PAGE_SIZE < total_count:
+        nav.append(("Dalej ➡️", f"admin:list:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([("Wróć", "admin")])
+
+    lines = [f"<b>Produkty w realnym składzie</b> | strona {page + 1}/{total_pages}"]
     for p in products:
         lines.append(admin_product_list_line(p))
-    await edit_or_answer(callback, "\n".join(lines), admin_menu())
+    await edit_or_answer(callback, "\n".join(lines), kb(rows))
 
 
 async def admin_photo_list(callback: CallbackQuery, state: FSMContext, admin_id: int) -> None:
@@ -2638,6 +2663,9 @@ async def main() -> None:
     async def admin_list_handler(callback: CallbackQuery) -> None:
         await admin_list(callback, config.admin_ids)
 
+    async def admin_list_page_handler(callback: CallbackQuery) -> None:
+        await admin_list(callback, config.admin_ids, int(callback.data.split(":")[3]))
+
     async def admin_photo_list_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await admin_photo_list(callback, state, config.admin_ids)
 
@@ -2718,6 +2746,7 @@ async def main() -> None:
     dp.callback_query.register(admin_photo_list_handler, F.data == "admin:photo")
     dp.callback_query.register(admin_photo_select_handler, F.data.startswith("admin:photo:select:"))
     dp.callback_query.register(admin_list_handler, F.data == "admin:list")
+    dp.callback_query.register(admin_list_page_handler, F.data.startswith("admin:list:page:"))
     dp.callback_query.register(admin_orders_handler, F.data == "admin:orders")
     dp.callback_query.register(admin_orders_page_handler, F.data.startswith("admin:orders:page:"))
     dp.callback_query.register(admin_order_detail_handler, F.data.startswith("admin:order_detail:"))
