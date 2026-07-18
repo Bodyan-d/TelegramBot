@@ -1814,27 +1814,49 @@ async def save_product_photo(message: Message, state: FSMContext) -> None:
     await message.answer("Zdjęcie zostało zapisane dla produktu.", reply_markup=admin_menu())
 
 
-async def admin_availability(callback: CallbackQuery, admin_id: int) -> None:
+async def admin_availability(callback: CallbackQuery, admin_id: int, page: int = 0) -> None:
     if not await admin_only(callback, admin_id):
         return
+    page = max(page, 0)
+    offset = page * PRODUCT_LIST_PAGE_SIZE
     with closing(db()) as conn:
+        total_count = conn.execute("SELECT COUNT(*) AS count FROM client_products").fetchone()["count"]
+        if total_count and offset >= total_count:
+            page = max((total_count - 1) // PRODUCT_LIST_PAGE_SIZE, 0)
+            offset = page * PRODUCT_LIST_PAGE_SIZE
         products = conn.execute(
-            "SELECT * FROM client_products ORDER BY category, name"
+            """
+            SELECT *
+            FROM client_products
+            ORDER BY category, name
+            LIMIT ? OFFSET ?
+            """,
+            (PRODUCT_LIST_PAGE_SIZE, offset),
         ).fetchall()
     if not products:
         await edit_or_answer(callback, "Brak produktów do edycji.", admin_menu())
         return
-    rows = [
-        [
-            (
-                admin_product_button_text(p, prefix=f"{'Ukryj' if p['is_active'] else 'Pokaż'}: "),
-                f"admin:toggle:{p['id']}",
-            )
-        ]
-        for p in products
-    ]
+    total_pages = max((total_count + PRODUCT_LIST_PAGE_SIZE - 1) // PRODUCT_LIST_PAGE_SIZE, 1)
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(("⬅️ Wstecz", f"admin:availability:page:{page - 1}"))
+        nav.append(("Pierwsza", "admin:availability:page:0"))
+    if offset + PRODUCT_LIST_PAGE_SIZE < total_count:
+        nav.append(("Dalej ➡️", f"admin:availability:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    for product in products:
+        rows.append(
+            [
+                (
+                    admin_product_button_text(product, prefix=f"{'Ukryj' if product['is_active'] else 'Pokaż'}: "),
+                    f"admin:toggle:{product['id']}:{page}",
+                )
+            ]
+        )
     rows.append([("Wróć", "admin")])
-    lines = ["<b>Zmień dostępność klienta</b>"]
+    lines = [f"<b>Zmień dostępność klienta</b> | strona {page + 1}/{total_pages}"]
     for product in products:
         status = "aktywne" if product["is_active"] else "ukryte"
         lines.append(f"{admin_product_text_line(product)} | {status}")
@@ -1844,7 +1866,9 @@ async def admin_availability(callback: CallbackQuery, admin_id: int) -> None:
 async def admin_toggle(callback: CallbackQuery, admin_id: int) -> None:
     if not await admin_only(callback, admin_id):
         return
-    product_id = int(callback.data.split(":")[2])
+    parts = callback.data.split(":")
+    product_id = int(parts[2])
+    page = int(parts[3]) if len(parts) > 3 else 0
     with closing(db()) as conn:
         product = conn.execute("SELECT quantity, is_active FROM client_products WHERE id = ?", (product_id,)).fetchone()
         if product and product["quantity"] > 0:
@@ -1853,20 +1877,28 @@ async def admin_toggle(callback: CallbackQuery, admin_id: int) -> None:
                 (0 if product["is_active"] else 1, product_id),
             )
             conn.commit()
-    await admin_availability(callback, admin_id)
+    await admin_availability(callback, admin_id, page)
 
 
-async def admin_stock_list(callback: CallbackQuery, state: FSMContext, admin_id: int) -> None:
+async def admin_stock_list(callback: CallbackQuery, state: FSMContext, admin_id: int, page: int = 0) -> None:
     if not await admin_only(callback, admin_id):
         return
     await state.clear()
+    page = max(page, 0)
+    offset = page * PRODUCT_LIST_PAGE_SIZE
     with closing(db()) as conn:
+        total_count = conn.execute("SELECT COUNT(*) AS count FROM warehouse_products").fetchone()["count"]
+        if total_count and offset >= total_count:
+            page = max((total_count - 1) // PRODUCT_LIST_PAGE_SIZE, 0)
+            offset = page * PRODUCT_LIST_PAGE_SIZE
         products = conn.execute(
             """
             SELECT *
             FROM warehouse_products
             ORDER BY category, name, volume, resistance
-            """
+            LIMIT ? OFFSET ?
+            """,
+            (PRODUCT_LIST_PAGE_SIZE, offset),
         ).fetchall()
 
     if not products:
@@ -1874,15 +1906,23 @@ async def admin_stock_list(callback: CallbackQuery, state: FSMContext, admin_id:
         return
 
     try:
-        rows = [
-            [(admin_product_button_text(p), f"admin:stock:select:{p['id']}")]
-            for p in products
-        ]
+        total_pages = max((total_count + PRODUCT_LIST_PAGE_SIZE - 1) // PRODUCT_LIST_PAGE_SIZE, 1)
+        rows = []
+        nav = []
+        if page > 0:
+            nav.append(("⬅️ Wstecz", f"admin:stock:page:{page - 1}"))
+            nav.append(("Pierwsza", "admin:stock:page:0"))
+        if offset + PRODUCT_LIST_PAGE_SIZE < total_count:
+            nav.append(("Dalej ➡️", f"admin:stock:page:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        for product in products:
+            rows.append([(admin_product_button_text(product), f"admin:stock:select:{product['id']}")])
     except Exception as exc:
         await edit_or_answer(callback, f"Nie udało się zbudować listy produktów:\n<code>{exc}</code>", admin_menu())
         return
     rows.append([("Wróć", "admin")])
-    lines = ["<b>Wybierz produkt do zmiany ilości</b>"]
+    lines = [f"<b>Wybierz produkt do zmiany ilości</b> | strona {page + 1}/{total_pages}"]
     for product in products:
         lines.append(admin_product_text_line(product))
     await edit_or_answer(callback, "\n\n".join(lines), kb(rows))
@@ -2690,11 +2730,17 @@ async def main() -> None:
     async def admin_availability_handler(callback: CallbackQuery) -> None:
         await admin_availability(callback, config.admin_ids)
 
+    async def admin_availability_page_handler(callback: CallbackQuery) -> None:
+        await admin_availability(callback, config.admin_ids, int(callback.data.split(":")[3]))
+
     async def admin_toggle_handler(callback: CallbackQuery) -> None:
         await admin_toggle(callback, config.admin_ids)
 
     async def admin_stock_list_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await admin_stock_list(callback, state, config.admin_ids)
+
+    async def admin_stock_page_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await admin_stock_list(callback, state, config.admin_ids, int(callback.data.split(":")[3]))
 
     async def admin_stock_select_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await admin_stock_select(callback, state, config.admin_ids)
@@ -2753,8 +2799,10 @@ async def main() -> None:
     dp.callback_query.register(admin_delete_order_start_handler, F.data == "admin:delete_order")
     dp.callback_query.register(custom_order_start_handler, F.data == "admin:custom")
     dp.callback_query.register(admin_stock_list_handler, F.data == "admin:stock")
+    dp.callback_query.register(admin_stock_page_handler, F.data.startswith("admin:stock:page:"))
     dp.callback_query.register(admin_stock_select_handler, F.data.startswith("admin:stock:select:"))
     dp.callback_query.register(admin_availability_handler, F.data == "admin:availability")
+    dp.callback_query.register(admin_availability_page_handler, F.data.startswith("admin:availability:page:"))
     dp.callback_query.register(admin_toggle_handler, F.data.startswith("admin:toggle:"))
     dp.callback_query.register(admin_delete_list_handler, F.data == "admin:delete")
     dp.callback_query.register(admin_delete_confirm_handler, F.data.startswith("admin:delete:confirm:"))
